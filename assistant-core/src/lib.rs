@@ -1,7 +1,13 @@
+pub mod comfyui;
 pub mod config;
+pub mod cortex_memory;
 pub mod error;
+pub mod llm_reasoner;
 pub mod pipeline;
 pub mod providers;
+pub mod runner;
+pub mod shell_tools;
+pub mod simple_knowledge;
 pub mod types;
 
 use config::AssistantConfig;
@@ -337,5 +343,207 @@ mod tests {
 
         let response = assistant.process(test_input("hello")).unwrap();
         assert_eq!(response.memories_stored, 0);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::cortex_memory::SimpleMemoryStore;
+    use crate::providers::*;
+    use crate::shell_tools::BuiltinTools;
+    use crate::simple_knowledge::SimpleKnowledgeStore;
+    use crate::types::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// A mock reasoner for integration tests that returns a plain response.
+    struct IntegrationMockReasoner {
+        use_tool: bool,
+        call_count: Mutex<usize>,
+    }
+
+    impl IntegrationMockReasoner {
+        fn simple() -> Self {
+            Self {
+                use_tool: false,
+                call_count: Mutex::new(0),
+            }
+        }
+
+        #[allow(dead_code)]
+        fn with_tool(name: &str) -> (Self, String) {
+            (
+                Self {
+                    use_tool: true,
+                    call_count: Mutex::new(0),
+                },
+                name.to_string(),
+            )
+        }
+    }
+
+    impl ReasonerProvider for IntegrationMockReasoner {
+        fn reason(
+            &self,
+            _context: &Context,
+            input: &str,
+            _tools: &[ToolInfo],
+        ) -> Result<ReasoningResult, AssistantError> {
+            let mut count = self.call_count.lock().unwrap();
+            *count += 1;
+
+            if self.use_tool && *count == 1 {
+                Ok(ReasoningResult::CallTool {
+                    name: "current_time".to_string(),
+                    args: serde_json::json!({}),
+                })
+            } else {
+                Ok(ReasoningResult::Respond(format!("Response to: {}", input)))
+            }
+        }
+    }
+
+    fn make_input(text: &str) -> UserInput {
+        UserInput {
+            text: text.to_string(),
+            user_id: "integration-test".to_string(),
+            channel: "test".to_string(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_simple_memory_store_integration() {
+        let store = SimpleMemoryStore::new(":memory:").unwrap();
+
+        // Store several memories
+        store.store("I like Rust programming", "chat").unwrap();
+        store.store("My favorite color is blue", "chat").unwrap();
+        store.store("I work on distributed systems", "chat").unwrap();
+
+        // Recall by keyword
+        let results = store.recall("Rust", 5).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains("Rust"));
+
+        // Recall with broad match
+        let results = store.recall("I", 10).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_simple_knowledge_store_integration() {
+        let store = SimpleKnowledgeStore::new(":memory:").unwrap();
+
+        store
+            .ingest(
+                "Rust Ownership",
+                "Rust uses ownership rules to manage memory.\n\nEach value has exactly one owner.\n\nWhen the owner goes out of scope, the value is dropped.",
+            )
+            .unwrap();
+
+        store
+            .ingest(
+                "Rust Borrowing",
+                "References allow borrowing without taking ownership.\n\nMutable references are exclusive.",
+            )
+            .unwrap();
+
+        // Query for ownership
+        let results = store.query("ownership", 5).unwrap();
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|s| s.title == "Rust Borrowing"));
+
+        // Query for scope
+        let results = store.query("scope", 5).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].title, "Rust Ownership");
+    }
+
+    #[test]
+    fn test_builtin_tools_current_time() {
+        let tools = BuiltinTools::new();
+        let result = tools.invoke("current_time", serde_json::json!({})).unwrap();
+        assert!(result["utc"].as_str().unwrap().contains("T"));
+        assert!(result["unix"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn test_builtin_tools_read_file() {
+        let tools = BuiltinTools::new();
+
+        // Write a temp file, then read it
+        let tmp = std::env::temp_dir().join("assistant_integration_test.txt");
+        std::fs::write(&tmp, "integration test content").unwrap();
+
+        let result = tools
+            .invoke(
+                "read_file",
+                serde_json::json!({"path": tmp.to_str().unwrap()}),
+            )
+            .unwrap();
+        assert_eq!(result["content"], "integration test content");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_full_pipeline_with_real_providers() {
+        let memory = SimpleMemoryStore::new(":memory:").unwrap();
+        let knowledge = SimpleKnowledgeStore::new(":memory:").unwrap();
+        let tools = BuiltinTools::new();
+
+        // Pre-populate knowledge
+        knowledge
+            .ingest(
+                "Project Info",
+                "The assistant project is built in Rust.\n\nIt uses a modular provider architecture.",
+            )
+            .unwrap();
+
+        // Pre-populate memory
+        memory
+            .store("User previously asked about Rust", "chat")
+            .unwrap();
+
+        let assistant = Assistant::new(AssistantConfig::default())
+            .with_memory(Box::new(memory))
+            .with_knowledge(Box::new(knowledge))
+            .with_tools(Box::new(tools))
+            .with_reasoner(Box::new(IntegrationMockReasoner::simple()));
+
+        let response = assistant.process(make_input("Rust")).unwrap();
+
+        assert!(response.text.contains("Response to:"));
+        assert_eq!(response.memories_stored, 1);
+        // Knowledge query for "Rust" matches chunks containing "Rust"
+        assert!(!response.sources.is_empty());
+    }
+
+    #[test]
+    fn test_full_pipeline_with_tool_call() {
+        let memory = SimpleMemoryStore::new(":memory:").unwrap();
+        let tools = BuiltinTools::new();
+
+        let reasoner = IntegrationMockReasoner {
+            use_tool: true,
+            call_count: Mutex::new(0),
+        };
+
+        let assistant = Assistant::new(AssistantConfig::default())
+            .with_memory(Box::new(memory))
+            .with_tools(Box::new(tools))
+            .with_reasoner(Box::new(reasoner));
+
+        let response = assistant
+            .process(make_input("What time is it?"))
+            .unwrap();
+
+        assert!(!response.text.is_empty());
+        assert_eq!(response.actions_taken.len(), 1);
+        assert_eq!(response.actions_taken[0].tool_name, "current_time");
+        // The tool result should contain a timestamp
+        assert!(response.actions_taken[0].result_summary.contains("utc"));
     }
 }

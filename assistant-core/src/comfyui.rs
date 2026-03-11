@@ -1,0 +1,1 @@
+// ComfyUI integration — placeholder module.

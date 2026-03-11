@@ -19,4 +19,7 @@ pub enum AssistantError {
 
     #[error("config error: {0}")]
     Config(String),
+
+    #[error("comfyui error: {0}")]
+    ComfyUI(String),
 }
