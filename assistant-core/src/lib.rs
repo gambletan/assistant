@@ -1,4 +1,5 @@
 pub mod comfyui;
+pub mod content_pipeline;
 pub mod config;
 pub mod cortex_memory;
 pub mod error;
