@@ -1,0 +1,3 @@
+[workspace]
+members = ["assistant-core"]
+resolver = "2"
